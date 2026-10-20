@@ -1,0 +1,23 @@
+# Python environment and cache
+.venv/
+__pycache__/
+*.pyc
+
+# Credentials
+.env
+.env.*
+!.env.example
+
+# Datasets and checkpoints
+data/
+models/
+checkpoints/
+outputs/
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+
+# Training logs
+wandb/
+runs/

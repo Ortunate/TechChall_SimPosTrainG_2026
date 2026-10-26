@@ -1,0 +1,7 @@
+# Inference-only environment. Resolve vLLM's matching PyTorch/CUDA wheels here.
+vllm
+datasets
+sympy
+math-verify
+latex2sympy2-extended
+pylatexenc

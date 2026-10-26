@@ -1,5 +1,6 @@
 # Python environment and cache
 .venv/
+.venv-vllm/
 __pycache__/
 *.pyc
 
@@ -21,3 +22,7 @@ outputs/
 # Training logs
 wandb/
 runs/
+
+# local stuff
+local/
+.vscode/

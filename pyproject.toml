@@ -8,6 +8,11 @@ dependencies = [
     "transformers>=4.47,<5",
     "datasets",
     "accelerate",
+    "sympy>=1.14.0",
+    "latex2sympy2-extended>=1.11.0",
+    "math-verify>=0.9.0",
+    "pylatexenc>=2.11",
+    "tensorboard>=2.21.0",
 ]
 
 [tool.uv]

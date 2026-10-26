@@ -3,7 +3,7 @@ name = "techchall-simpostraing-2026"
 version = "0.1.0"
 requires-python = ">=3.12,<3.13"
 dependencies = [
-    "numpy",
+    "numpy>=1.26,<2",
     "torch==2.14.1+cu130",
     "transformers>=4.47,<5",
     "datasets",
@@ -23,7 +23,14 @@ environments = [
 [tool.uv.sources]
 torch = { index = "pytorch-cu130" }
 
+# Dedicated PyTorch CUDA 13.0 mirror.
 [[tool.uv.index]]
 name = "pytorch-cu130"
-url = "https://download.pytorch.org/whl/cu130"
+url = "https://mirrors.nju.edu.cn/pytorch/whl/cu130"
 explicit = true
+
+# Default index for all other Python dependencies.
+[[tool.uv.index]]
+name = "nju-pypi"
+url = "https://mirror.nju.edu.cn/pypi/web/simple"
+default = true

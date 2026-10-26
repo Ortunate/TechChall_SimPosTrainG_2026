@@ -22,7 +22,7 @@ CONFIG = {
             "precalculus",
         ],
         # Maximum records per category; None means all records.
-        "limit_per_category": 5,
+        "limit_per_category": None,
     },
     "llm": {
         # Floating-point precision for model weights and computation.

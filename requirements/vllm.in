@@ -1,7 +1,10 @@
 # Inference-only environment. Resolve vLLM's matching PyTorch/CUDA wheels here.
-vllm
-datasets
+vllm>=0.11
+datasets==4.7.0
 sympy
 math-verify
 latex2sympy2-extended
 pylatexenc
+tensorboard
+transformers==4.57.6
+huggingface-hub==0.36.2

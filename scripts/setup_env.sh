@@ -1,24 +1,64 @@
+
 #!/usr/bin/env bash
-# Technical Challenge 2026 - Ubuntu 22.04 / WSL2 / AutoDL container setup
-# Usage: bash scripts/setup_env.sh [train|vllm|all]
+# Technical Challenge 2026 - WSL2 / AutoDL environment setup.
+#
+# Usage:
+#   bash scripts/setup_env.sh base
+#   bash scripts/setup_env.sh train
+#   bash scripts/setup_env.sh vllm
+#   bash scripts/setup_env.sh all
+#
+# base  : Install system tools, uv, and Python 3.12.
+# train : Prepare the locked training environment (.venv).
+# vllm  : Prepare the independent inference environment (.venv-vllm).
+# all   : Prepare vLLM first, then the training environment.
+
 set -Eeuo pipefail
 
-PROFILE="${1:-train}"
-case "$PROFILE" in train|vllm|all) ;; *) echo "Usage: $0 [train|vllm|all]" >&2; exit 2;; esac
-ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+PROFILE="${1:-base}"
+
+case "$PROFILE" in
+    base|train|vllm|all) ;;
+    *)
+        echo "Usage: $0 [base|train|vllm|all]" >&2
+        exit 2
+        ;;
+esac
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
-log() { printf '\n[setup] %s\n' "$*"; }
-fail() { printf '[setup] ERROR: %s\n' "$*" >&2; exit 1; }
+log() {
+    printf '\n[setup] %s\n' "$*"
+}
 
-[[ -f /etc/os-release ]] || fail 'Only Ubuntu Linux is supported.'
-# shellcheck disable=SC1091
-source /etc/os-release
-[[ "${ID:-}" == "ubuntu" ]] || fail "Expected Ubuntu; found ${ID:-unknown}."
-[[ "$(uname -m)" == "x86_64" ]] || fail 'This setup targets x86_64.'
+fail() {
+    printf '[setup] ERROR: %s\n' "$*" >&2
+    exit 1
+}
 
+# ------------------------------------------------------------
+# 1. Load environment configuration.
+# ------------------------------------------------------------
+
+[[ -f "$ROOT/scripts/env.sh" ]] \
+    || fail "Missing scripts/env.sh"
+
+# Load package mirrors and cache paths from the shared script.
+source "$ROOT/scripts/env.sh"
+
+# Default mirror for ordinary Python packages.
+VLLM_PYPI_INDEX="${UV_DEFAULT_INDEX:-https://mirror.nju.edu.cn/pypi/web/simple}"
+
+# CUDA 12.9 PyTorch mirror for the independent vLLM environment.
+VLLM_TORCH_INDEX="${VLLM_TORCH_INDEX:-https://mirrors.nju.edu.cn/pytorch/whl/cu129}"
+
+# Apply conservative download settings if not already configured.
+export UV_HTTP_TIMEOUT="${UV_HTTP_TIMEOUT:-120}"
+export UV_CONCURRENT_DOWNLOADS="${UV_CONCURRENT_DOWNLOADS:-4}"
+
+# Ensure large caches remain outside the AutoDL system disk.
 if [[ -d /root/autodl-tmp && -w /root/autodl-tmp ]]; then
-    # AutoDL: put large caches and downloaded Python runtimes on the data disk.
     export HF_HOME="${HF_HOME:-/root/autodl-tmp/cache/huggingface}"
     export UV_CACHE_DIR="${UV_CACHE_DIR:-/root/autodl-tmp/cache/uv}"
     export UV_PYTHON_INSTALL_DIR="${UV_PYTHON_INSTALL_DIR:-/root/autodl-tmp/cache/uv-python}"
@@ -26,81 +66,245 @@ else
     export HF_HOME="${HF_HOME:-$HOME/.cache/huggingface}"
     export UV_CACHE_DIR="${UV_CACHE_DIR:-$HOME/.cache/uv}"
 fi
+
 mkdir -p "$HF_HOME" "$UV_CACHE_DIR"
-if [[ -n "${UV_PYTHON_INSTALL_DIR:-}" ]]; then mkdir -p "$UV_PYTHON_INSTALL_DIR"; fi
 
-# Do not install a Linux NVIDIA driver or CUDA toolkit inside WSL2/AutoDL containers.
+if [[ -n "${UV_PYTHON_INSTALL_DIR:-}" ]]; then
+    mkdir -p "$UV_PYTHON_INSTALL_DIR"
+fi
+
+log "Selected profile: $PROFILE"
+log "Python package index: $VLLM_PYPI_INDEX"
+log "vLLM PyTorch index: $VLLM_TORCH_INDEX"
+log "HF_HOME: $HF_HOME"
+log "UV_CACHE_DIR: $UV_CACHE_DIR"
+
+
+# ------------------------------------------------------------
+# 2. Validate operating system and GPU visibility.
+# ------------------------------------------------------------
+
+[[ -f /etc/os-release ]] \
+    || fail "Cannot detect the operating system."
+
+source /etc/os-release
+
+[[ "${ID:-}" == "ubuntu" ]] \
+    || fail "This script requires Ubuntu."
+
+[[ "$(uname -m)" == "x86_64" ]] \
+    || fail "This script requires x86_64."
+
+# GPU access is optional during environment installation.
 if command -v nvidia-smi >/dev/null 2>&1; then
-    log 'GPU driver check (driver-managed CUDA version, not toolkit version):'
-    nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader || true
-elif [[ -x /usr/lib/wsl/lib/nvidia-smi ]]; then
-    log 'WSL GPU driver check:'
-    /usr/lib/wsl/lib/nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader || true
+    log "Checking accessible NVIDIA GPUs..."
+
+    if ! nvidia-smi -L; then
+        log "No accessible GPU. CPU-only installation may continue."
+    fi
 else
-    log 'WARNING: nvidia-smi not found. CPU-only checks can run, but GPU tests require host GPU access.'
-fi
-if command -v nvcc >/dev/null 2>&1; then
-    log "CUDA compiler detected: $(nvcc --version | tail -n 1)"
-else
-    log 'No nvcc compiler found. This is OK for precompiled PyTorch/vLLM wheels.'
+    log "nvidia-smi unavailable. GPU verification is deferred."
 fi
 
-# System utilities: check before installation; apt operations run sequentially.
-pkgs=(ca-certificates curl git openssh-client tmux build-essential)
+# The CUDA Toolkit compiler is not required for prebuilt wheels.
+if command -v nvcc >/dev/null 2>&1; then
+    log "CUDA Toolkit detected:"
+    nvcc --version | tail -n 1
+else
+    log "CUDA Toolkit compiler not found; this is acceptable."
+fi
+
+
+# ------------------------------------------------------------
+# 3. Install missing Ubuntu system packages.
+# ------------------------------------------------------------
+
+packages=(
+    ca-certificates
+    curl
+    git
+    openssh-client
+    tmux
+    build-essential
+)
+
 missing=()
-for p in "${pkgs[@]}"; do
-    if ! dpkg-query -W -f='${Status}' "$p" 2>/dev/null | grep -qx 'install ok installed'; then
-        missing+=("$p")
+
+for package in "${packages[@]}"; do
+    if ! dpkg-query -W -f='${Status}' "$package" 2>/dev/null \
+        | grep -qx 'install ok installed'; then
+        missing+=("$package")
     fi
 done
+
 if (( ${#missing[@]} > 0 )); then
-    command -v apt-get >/dev/null 2>&1 || fail 'apt-get unavailable.'
-    if (( EUID == 0 )); then admin=();
-    else command -v sudo >/dev/null 2>&1 || fail 'sudo is required to install missing system packages.'; admin=(sudo); fi
-    log "Installing missing Ubuntu packages: ${missing[*]}"
+    if (( EUID == 0 )); then
+        admin=()
+    else
+        command -v sudo >/dev/null 2>&1 \
+            || fail "sudo is required to install system packages."
+        admin=(sudo)
+    fi
+
+    # APT requires /tmp to be writable by the unprivileged _apt user.
+    if (( EUID == 0 )) \
+        && id _apt >/dev/null 2>&1 \
+        && command -v runuser >/dev/null 2>&1; then
+
+        runuser -u _apt -- sh -c \
+            'f=$(mktemp /tmp/apt.conf.XXXXXX) && rm -f "$f"' \
+            || fail "APT cannot write to /tmp. Check permissions (1777) and disk space."
+    fi
+
+    log "Installing missing system packages: ${missing[*]}"
+
     "${admin[@]}" apt-get update
     "${admin[@]}" apt-get install -y "${missing[@]}"
 else
-    log 'All required Ubuntu system packages already installed.'
+    log "All required Ubuntu packages are installed."
 fi
+
+
+# ------------------------------------------------------------
+# 4. Install uv and locate Python 3.12.
+# ------------------------------------------------------------
+
+export PATH="$HOME/.local/bin:$PATH"
 
 if ! command -v uv >/dev/null 2>&1; then
-    log 'Installing uv from the official installer...'
+    log "Installing uv..."
+
     curl -LsSf https://astral.sh/uv/install.sh | sh
 fi
-export PATH="$HOME/.local/bin:$PATH"
-command -v uv >/dev/null 2>&1 || fail 'uv still not on PATH; check installation and ~/.local/bin.'
-log "uv: $(uv --version)"
+
+command -v uv >/dev/null 2>&1 \
+    || fail "uv installation failed."
+
+log "uv version: $(uv --version)"
+
 if ! uv python find 3.12 >/dev/null 2>&1; then
-    log 'Installing Python 3.12 with uv...'
+    log "Installing Python 3.12..."
     uv python install 3.12
 fi
-uv python find 3.12
 
-if [[ "$PROFILE" == train || "$PROFILE" == all ]]; then
-    [[ -f pyproject.toml ]] || fail 'Missing pyproject.toml: declare train dependencies first.'
-    log 'Synchronizing training/development environment: .venv/'
-    if [[ -f uv.lock ]]; then
-        uv sync --locked
-    else
-        log 'No uv.lock found; generating initial lockfile.'
-        uv lock
-        uv sync --locked
+log "Python interpreter: $(uv python find 3.12)"
+
+
+# ------------------------------------------------------------
+# 5. Install the independent vLLM inference environment.
+# ------------------------------------------------------------
+
+if [[ "$PROFILE" == "vllm" || "$PROFILE" == "all" ]]; then
+
+    [[ -f requirements/vllm.in ]] \
+        || fail "Missing requirements/vllm.in"
+
+    log "Preparing vLLM inference environment: .venv-vllm"
+
+    # Keep inference dependencies separate from the training lockfile.
+    if [[ ! -f .venv-vllm/pyvenv.cfg ]]; then
+        uv venv --python 3.12 .venv-vllm
     fi
-    .venv/bin/python -c 'import torch; print("PyTorch:", torch.__version__, "CUDA:", torch.version.cuda, "GPU available:", torch.cuda.is_available())'
-fi
 
-if [[ "$PROFILE" == vllm || "$PROFILE" == all ]]; then
-    [[ -f requirements/vllm.in ]] || fail 'Missing requirements/vllm.in.'
-    log 'Preparing independent vLLM environment: .venv-vllm/'
-    if [[ ! -f .venv-vllm/pyvenv.cfg ]]; then uv venv --python 3.12 .venv-vllm; fi
-    uv pip install --python .venv-vllm/bin/python --torch-backend=auto -r requirements/vllm.in
-    .venv-vllm/bin/python -c 'import vllm,torch; print("vLLM:",vllm.__version__,"PyTorch:",torch.__version__,"CUDA:",torch.version.cuda)'
+    # The vLLM prebuilt CUDA wheels currently target CUDA 12.9.
+    #
+    # --no-config:
+    #   Ignore the training project's uv index configuration.
+    #
+    # --default-index:
+    #   Resolve ordinary dependencies through the NJU PyPI mirror.
+    #
+    # --index:
+    #   Give the NJU CUDA 12.9 PyTorch index higher priority.
+    #
+    # --only-binary vllm:
+    #   Do not compile vLLM from source.
+    #
+    # UV_TORCH_BACKEND is explicitly unset because it would override
+    # the custom PyTorch mirror, even without --torch-backend.
+
+    env -u UV_TORCH_BACKEND uv pip install \
+        --no-config \
+        --python .venv-vllm/bin/python \
+        --default-index "$VLLM_PYPI_INDEX" \
+        --index "$VLLM_TORCH_INDEX" \
+        --only-binary vllm \
+        -r requirements/vllm.in
+
+    log "Checking installed inference dependencies..."
+
+    # Inspect installation metadata without requiring an active GPU.
+    .venv-vllm/bin/python -c '
+import importlib.metadata as metadata
+import torch
+
+print("vLLM:", metadata.version("vllm"))
+print("PyTorch:", torch.__version__)
+print("CUDA runtime:", torch.version.cuda)
+print("GPU available:", torch.cuda.is_available())
+'
+
     mkdir -p outputs/environments
-    uv pip freeze --python .venv-vllm/bin/python > outputs/environments/vllm-freeze.txt
-    log 'vLLM dependency snapshot: outputs/environments/vllm-freeze.txt'
+
+    # Record actual installed versions for experiment reproducibility.
+    uv pip freeze \
+        --python .venv-vllm/bin/python \
+        > outputs/environments/vllm-freeze.txt
+
+    log "vLLM environment installed."
+    log "Dependency snapshot: outputs/environments/vllm-freeze.txt"
 fi
 
-log 'Completed. Use .venv/bin/python for training, .venv-vllm/bin/python for vLLM.'
-log "HF_HOME=$HF_HOME"
-log 'Note: exported paths apply only to this setup process; use scripts/env.sh when running experiments.'
+
+# ------------------------------------------------------------
+# 6. Synchronize the locked training environment.
+# ------------------------------------------------------------
+
+if [[ "$PROFILE" == "train" || "$PROFILE" == "all" ]]; then
+
+    [[ -f pyproject.toml ]] \
+        || fail "Missing pyproject.toml"
+
+    [[ -f uv.lock ]] \
+        || fail "Missing uv.lock. Generate and verify it first."
+
+    log "Synchronizing training environment: .venv"
+
+    # Preserve the exact dependency versions and sources in uv.lock.
+    uv sync --locked
+
+    log "Checking installed training dependencies..."
+
+    .venv/bin/python -c '
+import torch
+
+print("PyTorch:", torch.__version__)
+print("CUDA runtime:", torch.version.cuda)
+print("GPU available:", torch.cuda.is_available())
+'
+
+    mkdir -p outputs/environments
+
+    uv pip freeze \
+        --python .venv/bin/python \
+        > outputs/environments/train-freeze.txt
+
+    log "Training environment synchronized."
+    log "Dependency snapshot: outputs/environments/train-freeze.txt"
+fi
+
+
+# ------------------------------------------------------------
+# 7. Final instructions.
+# ------------------------------------------------------------
+
+log "Setup completed successfully: $PROFILE"
+
+log "Training Python: $ROOT/.venv/bin/python"
+log "Inference Python: $ROOT/.venv-vllm/bin/python"
+
+log "Before running experiments in a new shell:"
+log "  cd $ROOT"
+log "  source scripts/env.sh"
+
+log "GPU model loading must be verified after GPU allocation."

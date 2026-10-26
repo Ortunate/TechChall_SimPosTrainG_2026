@@ -26,3 +26,4 @@ runs/
 # local stuff
 local/
 .vscode/
+tmux*
